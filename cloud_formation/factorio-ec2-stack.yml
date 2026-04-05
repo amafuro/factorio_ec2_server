@@ -1,0 +1,366 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 Control via Lambda Function URL with Factorio SG, KeyPair, Auto-start script, and RCON Player Check'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: 作成するEC2インスタンスのタイプ
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
+  ApiAuthKeyParamName:
+    Type: String
+    Default: 'ec2-api-auth-key'
+    Description: SSMパラメータストアに保存したLambda用の認証キーの名前
+  SshAllowedCidrParam:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: 'ec2-ssh-allowed-cidr'
+    Description: SSHアクセスを許可するIPアドレスが保存されたSSMパラメータの名前
+  SaveDataNameParam:
+    Type: String
+    Default: 'factorio-save-data-name'
+    Description: SSMパラメータストアに保存したセーブデータ名
+  RconPasswordParamName:
+    Type: String
+    Default: 'factorio-rcon-password'
+    Description: SSMパラメータストアに保存したRCON用のパスワード(SecureString推奨)
+
+Resources:
+  # 1. EC2アクセス用のキーペア
+  MyKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: factorio-ec2-key
+      KeyType: rsa
+
+  # 2. Factorio用およびSSH用セキュリティグループ
+  FactorioSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow Factorio custom UDP port and SSH"
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 34197
+          ToPort: 34197
+          CidrIp: 0.0.0.0/0
+          Description: "Factorio multiplayer port"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshAllowedCidrParam
+          Description: "SSH connection from allowed IP"
+        # RCONポート(27015)はEC2内部（localhost）からのみアクセスするためSGで開ける必要はありません（安全です）
+
+  # 3. EC2用のIAMロールとインスタンスプロファイル
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM Run Commandを受信するために必要なAWS管理ポリシーを追加
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EC2SSMGetParameterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SaveDataNameParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${RconPasswordParamName}'
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  # 4. EC2インスタンス
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref MyKeyPair
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt FactorioSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ManagedControlInstance
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            
+            # SSMからRCONパスワードを取得して隠しファイルに保存
+            RCON_PASS=$(aws ssm get-parameter --name "${RconParamName}" --with-decryption --query "Parameter.Value" --output text --region "${AWSRegion}")
+            echo "$RCON_PASS" > /home/ec2-user/.rcon_pass
+            chmod 600 /home/ec2-user/.rcon_pass
+            chown ec2-user:ec2-user /home/ec2-user/.rcon_pass
+            
+            # Python製の簡易RCONクライアントスクリプトを作成
+            cat << 'EOF_RCON' > /home/ec2-user/rcon.py
+            import socket, struct, sys
+            def rcon_cmd(host, port, pwd, cmd):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5)
+                try:
+                    s.connect((host, port))
+                    # RCON認証パケット
+                    s.send(struct.pack('<3i', 10 + len(pwd), 1, 3) + pwd.encode('utf-8') + b'\x00\x00')
+                    s.recv(4096)
+                    # コマンド送信パケット
+                    s.send(struct.pack('<3i', 10 + len(cmd), 2, 2) + cmd.encode('utf-8') + b'\x00\x00')
+                    # 結果受信
+                    resp = s.recv(4096)
+                    if len(resp) >= 12:
+                        return resp[12:-2].decode('utf-8')
+                    return "No response"
+                except Exception as e:
+                    return f"Connection error: {e}"
+                finally:
+                    s.close()
+
+            if __name__ == '__main__':
+                with open('/home/ec2-user/.rcon_pass', 'r') as f:
+                    pwd = f.read().strip()
+                print(rcon_cmd('127.0.0.1', 27015, pwd, sys.argv[1]))
+            EOF_RCON
+            chmod +x /home/ec2-user/rcon.py
+            chown ec2-user:ec2-user /home/ec2-user/rcon.py
+
+            # Factorio起動用ラッパースクリプトの作成 (RCONオプションを追加)
+            cat << 'EOF' > /home/ec2-user/start_factorio.sh
+            #!/bin/bash
+            SAVE_NAME=$(aws ssm get-parameter --name "${SSMParamName}" --query "Parameter.Value" --output text --region "${AWSRegion}")
+            if [ -z "$SAVE_NAME" ]; then SAVE_NAME="default_save"; fi
+            RCON_PASS=$(cat /home/ec2-user/.rcon_pass)
+            
+            exec /home/ec2-user/factorio/bin/x64/factorio --start-server "$SAVE_NAME" --port 34197 --rcon-port 27015 --rcon-password "$RCON_PASS"
+            EOF
+            chmod +x /home/ec2-user/start_factorio.sh
+            chown ec2-user:ec2-user /home/ec2-user/start_factorio.sh
+            
+            # systemdサービス作成と起動
+            cat << 'EOF' > /etc/systemd/system/factorio.service
+            [Unit]
+            Description=Factorio Server
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=ec2-user
+            WorkingDirectory=/home/ec2-user/factorio/bin/x64
+            ExecStart=/home/ec2-user/start_factorio.sh
+            Restart=on-failure
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable factorio.service
+            systemctl start factorio.service
+          # 置換変数
+          - SSMParamName: !Ref SaveDataNameParam
+            RconParamName: !Ref RconPasswordParamName
+            AWSRegion: !Ref AWS::Region
+
+  # 5. Lambda用の権限設定
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2ControlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                Resource: "*"
+        - PolicyName: SSMGetParameterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApiAuthKeyParamName}'
+        - PolicyName: SSMSendCommandPolicy # 追加：LambdaからEC2内でコマンドを実行する権限
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: "*"
+        - PolicyName: LambdaLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  # 6. Lambda関数
+  Ec2ControllerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DirectEc2ControllerFunctionUrl
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          TARGET_INSTANCE_ID: !Ref MyEC2Instance
+          AUTH_KEY_PARAMETER_NAME: !Ref ApiAuthKeyParamName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+
+          ec2 = boto3.client('ec2')
+          ssm = boto3.client('ssm')
+          instance_id = os.environ['TARGET_INSTANCE_ID']
+          auth_key_param = os.environ['AUTH_KEY_PARAMETER_NAME']
+
+          def lambda_handler(event, context):
+              try:
+                  query_params = event.get('queryStringParameters') or {}
+                  provided_key = query_params.get('auth_key')
+          
+                  correct_key = ssm.get_parameter(Name=auth_key_param, WithDecryption=True)['Parameter']['Value']
+          
+                  if provided_key != correct_key:
+                      return {'statusCode': 403, 'body': 'Error: Invalid auth_key'}
+
+                  action = query_params.get('action')
+          
+                  if action == 'start':
+                      ec2.start_instances(InstanceIds=[instance_id])
+                      result_msg = f"Success: Starting instance {instance_id}"
+                  elif action == 'stop':
+                      ec2.stop_instances(InstanceIds=[instance_id])
+                      result_msg = f"Success: Stopping instance {instance_id}"
+                  elif action == 'status':
+                      response = ec2.describe_instances(InstanceIds=[instance_id])
+                      state = response['Reservations'][0]['Instances'][0]['State']['Name']
+                      result_msg = f"Status: Instance {instance_id} is currently [{state}]"
+                  elif action == 'ip':
+                      response = ec2.describe_instances(InstanceIds=[instance_id])
+                      instance = response['Reservations'][0]['Instances'][0]
+                      state = instance['State']['Name']
+                      if state == 'running':
+                          public_ip = instance.get('PublicIpAddress', 'No Public IP assigned yet')
+                          result_msg = f"Public IP: {public_ip}"
+                      else:
+                          result_msg = f"Error: Cannot get IP. Instance is currently [{state}]. Please start the instance first."
+                  elif action == 'players':
+                      # サーバーが起動しているか確認
+                      response = ec2.describe_instances(InstanceIds=[instance_id])
+                      state = response['Reservations'][0]['Instances'][0]['State']['Name']
+                      if state != 'running':
+                          result_msg = f"Error: Instance is [{state}]. Start the server to check players."
+                      else:
+                          # SSM Run Commandを使用してEC2内部のRCONスクリプトを実行
+                          cmd_response = ssm.send_command(
+                              InstanceIds=[instance_id],
+                              DocumentName="AWS-RunShellScript",
+                              Parameters={'commands': ['python3 /home/ec2-user/rcon.py "/players online"']}
+                          )
+                          command_id = cmd_response['Command']['CommandId']
+          
+                          # コマンドの完了を待機 (Lambdaタイムアウトを考慮し最大約8秒)
+                          time.sleep(1.5)
+                          invocation = None
+                          for _ in range(8):
+                              invocation = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+                              if invocation['Status'] not in ['Pending', 'InProgress']:
+                                  break
+                              time.sleep(1)
+          
+                          result_msg = invocation.get('StandardOutputContent', '').strip()
+                          if not result_msg:
+                              err = invocation.get('StandardErrorContent', '').strip()
+                              result_msg = f"Server is booting or error occurred. Details: {err}" if err else "Failed to fetch player data. Server might still be booting."
+                  else:
+                      return {
+                          'statusCode': 400, 
+                          'body': 'Error: Invalid action. Use ?action=start, stop, status, ip, or players'
+                      }
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'text/plain; charset=utf-8'},
+                      'body': result_msg
+                  }
+              except Exception as e:
+                  return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+
+  # 7. Lambda Function URLの有効化
+  LambdaFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt Ec2ControllerLambda.Arn
+      Cors:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - "*"
+
+  # 8. Function URLへのパブリックアクセス許可
+  LambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: LambdaFunctionUrl
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt Ec2ControllerLambda.Arn
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+Outputs:
+  PrivateKeySSMPath:
+    Description: "生成された秘密鍵が保存されているSSMパラメータストアのパス"
+    Value: !Sub "/ec2/keypair/${MyKeyPair.KeyPairId}"
+  StartURL:
+    Description: "起動用URL"
+    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=start&auth_key=YOUR_KEY"
+  StopURL:
+    Description: "停止用URL"
+    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=stop&auth_key=YOUR_KEY"
+  StatusURL:
+    Description: "状態確認用URL"
+    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=status&auth_key=YOUR_KEY"
+  IpURL:
+    Description: "IPアドレス取得用URL"
+    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=ip&auth_key=YOUR_KEY"
+  PlayersURL: # 追加：人数確認用の出力
+    Description: "オンラインプレイヤー確認用URL"
+    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=players&auth_key=YOUR_KEY"

@@ -560,3 +560,49 @@ Outputs:
   AppCheckURL:
     Description: "Discord通知付きのIP確認用URL"
     Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check&auth_key=YOUR_KEY"
+
+  # -----------------------------------------------------------
+  # EventBridge (スケジュール起動・停止)
+  # -----------------------------------------------------------
+  # 日本時間23:00 (UTC 14:00) に起動
+  StartServerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Start Factorio server daily at 23:00 JST"
+      ScheduleExpression: "cron(0 14 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrchestratorLambda.Arn
+          Id: "TargetOrchestratorLambdaStart"
+          Input: '{"action": "start"}'
+
+  # 日本時間01:00 (UTC 16:00) に停止
+  StopServerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Stop Factorio server daily at 01:00 JST"
+      ScheduleExpression: "cron(0 16 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrchestratorLambda.Arn
+          Id: "TargetOrchestratorLambdaStop"
+          Input: '{"action": "stop"}'
+
+  # -----------------------------------------------------------
+  # EventBridgeからOrchestratorLambdaを実行するための権限
+  # -----------------------------------------------------------
+  EventBridgeInvokePermissionStart:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartServerEventRule.Arn
+
+  EventBridgeInvokePermissionStop:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopServerEventRule.Arn

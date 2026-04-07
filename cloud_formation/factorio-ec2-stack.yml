@@ -494,18 +494,11 @@ Resources:
                   await initParams();
           
                   let action = '';
-                  let providedKey = '';
 
                   if (event.queryStringParameters) {
                       action = event.queryStringParameters.action;
-                      providedKey = event.queryStringParameters.auth_key;
                   } else if (event.action) {
                       action = event.action;
-                      providedKey = cachedAuthKey;
-                  }
-
-                  if (providedKey !== cachedAuthKey) {
-                      return { statusCode: 403, body: 'Error: Invalid auth_key' };
                   }
 
                   switch (action) {
@@ -597,10 +590,10 @@ Outputs:
     Value: !Sub "/ec2/keypair/${MyKeyPair.KeyPairId}"
   AppStartURL:
     Description: "Discord通知付きの起動用URL"
-    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=start&auth_key=YOUR_KEY"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=start"
   AppStopURL:
     Description: "Discord通知付きの停止用URL"
-    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=stop&auth_key=YOUR_KEY"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=stop"
   AppCheckURL:
     Description: "Discord通知付きのIP確認用URL"
-    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check&auth_key=YOUR_KEY"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check"

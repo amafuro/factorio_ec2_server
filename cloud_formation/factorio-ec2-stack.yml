@@ -218,8 +218,8 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: DirectEc2ControllerFunctionUrl
-      Runtime: python3.12
-      Handler: index.lambda_handler
+      Runtime: nodejs20.x
+      Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 15
       Environment:
@@ -228,58 +228,95 @@ Resources:
           AUTH_KEY_PARAMETER_NAME: !Ref ApiAuthKeyParamName
       Code:
         ZipFile: |
-          import json, boto3, os, time
-          ec2 = boto3.client('ec2')
-          ssm = boto3.client('ssm')
-          instance_id = os.environ['TARGET_INSTANCE_ID']
-          auth_key_param = os.environ['AUTH_KEY_PARAMETER_NAME']
-          def lambda_handler(event, context):
-              try:
-                  query_params = event.get('queryStringParameters') or {}
-                  provided_key = query_params.get('auth_key')
-                  correct_key = ssm.get_parameter(Name=auth_key_param, WithDecryption=True)['Parameter']['Value']
-                  if provided_key != correct_key: return {'statusCode': 403, 'body': 'Error: Invalid auth_key'}
-                  action = query_params.get('action')
-                  if action == 'start':
-                      ec2.start_instances(InstanceIds=[instance_id])
-                      result_msg = f"Success: Starting instance {instance_id}"
-                  elif action == 'stop':
-                      ec2.stop_instances(InstanceIds=[instance_id])
-                      result_msg = f"Success: Stopping instance {instance_id}"
-                  elif action == 'status':
-                      response = ec2.describe_instances(InstanceIds=[instance_id])
-                      state = response['Reservations'][0]['Instances'][0]['State']['Name']
-                      result_msg = f"Status: Instance {instance_id} is currently [{state}]"
-                  elif action == 'ip':
-                      response = ec2.describe_instances(InstanceIds=[instance_id])
-                      instance = response['Reservations'][0]['Instances'][0]
-                      state = instance['State']['Name']
-                      if state == 'running':
-                          public_ip = instance.get('PublicIpAddress', 'No Public IP assigned yet')
-                          result_msg = f"Public IP: {public_ip}"
-                      else:
-                          result_msg = f"Error: Cannot get IP. Instance is currently [{state}]. Please start the instance first."
-                  elif action == 'players':
-                      response = ec2.describe_instances(InstanceIds=[instance_id])
-                      state = response['Reservations'][0]['Instances'][0]['State']['Name']
-                      if state != 'running': return {'statusCode': 200, 'body': f"Error: Instance is [{state}]."}
-                      cmd_response = ssm.send_command(
-                          InstanceIds=[instance_id],
-                          DocumentName="AWS-RunShellScript",
-                          Parameters={'commands': ['python3 /home/ec2-user/rcon.py "/players online"']}
-                      )
-                      command_id = cmd_response['Command']['CommandId']
-                      time.sleep(1.5)
-                      invocation = {}
-                      for _ in range(8):
-                          invocation = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
-                          if invocation['Status'] not in ['Pending', 'InProgress']: break
-                          time.sleep(1)
-                      result_msg = invocation.get('StandardOutputContent', '').strip()
-                      if not result_msg: result_msg = "Failed to fetch player data. Server might still be booting."
-                  else: return {'statusCode': 400, 'body': 'Error: Invalid action.'}
-                  return {'statusCode': 200, 'headers': {'Content-Type': 'text/plain; charset=utf-8'}, 'body': result_msg}
-              except Exception as e: return {'statusCode': 500, 'body': f"Error: {str(e)}"}
+          const { EC2Client, StartInstancesCommand, StopInstancesCommand, DescribeInstancesCommand } = require("@aws-sdk/client-ec2");
+          const { SSMClient, GetParameterCommand, SendCommandCommand, GetCommandInvocationCommand } = require("@aws-sdk/client-ssm");
+
+          const ec2 = new EC2Client();
+          const ssm = new SSMClient();
+
+          const instanceId = process.env.TARGET_INSTANCE_ID;
+          const authKeyParam = process.env.AUTH_KEY_PARAMETER_NAME;
+
+          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+          exports.handler = async (event) => {
+              try {
+                  const queryParams = event.queryStringParameters || {};
+                  const providedKey = queryParams.auth_key;
+          
+                  const authCmd = new GetParameterCommand({ Name: authKeyParam, WithDecryption: true });
+                  const correctKey = (await ssm.send(authCmd)).Parameter.Value;
+          
+                  if (providedKey !== correctKey) {
+                      return { statusCode: 403, body: 'Error: Invalid auth_key' };
+                  }
+          
+                  const action = queryParams.action;
+                  let resultMsg = "";
+          
+                  if (action === 'start') {
+                      await ec2.send(new StartInstancesCommand({ InstanceIds: [instanceId] }));
+                      resultMsg = `Success: Starting instance ${instanceId}`;
+                  } else if (action === 'stop') {
+                      await ec2.send(new StopInstancesCommand({ InstanceIds: [instanceId] }));
+                      resultMsg = `Success: Stopping instance ${instanceId}`;
+                  } else if (action === 'status') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const state = response.Reservations[0].Instances[0].State.Name;
+                      resultMsg = `Status: Instance ${instanceId} is currently [${state}]`;
+                  } else if (action === 'ip') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const instance = response.Reservations[0].Instances[0];
+                      const state = instance.State.Name;
+                      if (state === 'running') {
+                          const publicIp = instance.PublicIpAddress || 'No Public IP assigned yet';
+                          resultMsg = `Public IP: ${publicIp}`;
+                      } else {
+                          resultMsg = `Error: Cannot get IP. Instance is currently [${state}]. Please start the instance first.`;
+                      }
+                  } else if (action === 'players') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const state = response.Reservations[0].Instances[0].State.Name;
+                      if (state !== 'running') {
+                          return { statusCode: 200, body: `Error: Instance is [${state}].` };
+                      }
+          
+                      const cmdResponse = await ssm.send(new SendCommandCommand({
+                          InstanceIds: [instanceId],
+                          DocumentName: "AWS-RunShellScript",
+                          Parameters: { commands: ['python3 /home/ec2-user/rcon.py "/players online"'] }
+                      }));
+                      const commandId = cmdResponse.Command.CommandId;
+          
+                      await sleep(1500);
+                      let invocation = {};
+                      for (let i = 0; i < 8; i++) {
+                          invocation = await ssm.send(new GetCommandInvocationCommand({
+                              CommandId: commandId,
+                              InstanceId: instanceId
+                          }));
+                          if (!['Pending', 'InProgress'].includes(invocation.Status)) {
+                              break;
+                          }
+                          await sleep(1000);
+                      }
+                      resultMsg = (invocation.StandardOutputContent || '').trim();
+                      if (!resultMsg) {
+                          resultMsg = "Failed to fetch player data. Server might still be booting.";
+                      }
+                  } else {
+                      return { statusCode: 400, body: 'Error: Invalid action.' };
+                  }
+          
+                  return { 
+                      statusCode: 200, 
+                      headers: { 'Content-Type': 'text/plain; charset=utf-8' }, 
+                      body: resultMsg 
+                  };
+              } catch (e) {
+                  return { statusCode: 500, body: `Error: ${e.message}` };
+              }
+          };
 
   LambdaFunctionUrl:
     Type: AWS::Lambda::Url

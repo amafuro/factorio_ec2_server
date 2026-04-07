@@ -15,11 +15,13 @@ EC2を再起動するたびにIPアドレスが変わるため、起動時に接
 ## parameter storeにパラメータを登録する
 
 以下のパラメータについて、任意の値をparameter storeに登録する。
+DISCORD_WEBHOOK_URLは、discordのチャンネル設定から発行しておく。
 
 * ec2-api-auth-key
 * ec2-ssh-allowed-cidr
 * factorio-save-data-name（後でアップするセーブデータと同じ名前を登録しておく）
 * factorio-rcon-password
+* discord-webhook-url
 
 ## cloud formationでスタックを作成する
 
@@ -41,12 +43,7 @@ rm factorio_headless_x64_2.0.76.tar.gz
 
 最後にローカルのセーブデータを`/factorio/bin/x64/`へscpコマンドなどで配置する。
 
-## GASアプリをデプロイする
-gasファイルを作成し、コード.gsにリポジトリのコードを貼り付け、BASE_UR、AUTH_KEY、DISCORD_WEBHOOK_URLを記載しておく。
-DISCORD_WEBHOOK_URLは、discordのチャンネル設定から発行しておく。
-
-デプロイからウェブアプリとしてデプロイをし、生成されたURLをメモしておく。
-生成されたURLに`?action=start`もしくは`?action=stop`のパラメータをつけて叩くとサーバーを起動・停止でき、discordに接続先が通知される。
+配置後、CloudFormationのoutputに出力されたAppStartURLとAppStopURLを叩くとサーバーを起動・停止でき、discordに接続先が通知される。
 
 # その他
 セーブデータの持ち主がspase_ageのDLCを買っていてて、他の参加者が買っていない場合、サーバーログイン時に「modが違うので、同期しますか」が何度もでてログイン出来ないことがあった（DLCを買っているだけで、他はバニラ）。

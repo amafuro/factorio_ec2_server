@@ -549,8 +549,6 @@ Outputs:
   PrivateKeySSMPath:
     Description: "生成された秘密鍵が保存されているSSMパラメータストアのパス"
     Value: !Sub "/ec2/keypair/${MyKeyPair.KeyPairId}"
-
-  # Orchestrator経由でのアクセスURL
   AppStartURL:
     Description: "Discord通知付きの起動用URL"
     Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=start&auth_key=YOUR_KEY"

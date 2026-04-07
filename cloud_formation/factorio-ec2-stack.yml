@@ -545,20 +545,6 @@ Resources:
       Principal: "*"
       FunctionUrlAuthType: NONE
 
-Outputs:
-  PrivateKeySSMPath:
-    Description: "生成された秘密鍵が保存されているSSMパラメータストアのパス"
-    Value: !Sub "/ec2/keypair/${MyKeyPair.KeyPairId}"
-  AppStartURL:
-    Description: "Discord通知付きの起動用URL"
-    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=start&auth_key=YOUR_KEY"
-  AppStopURL:
-    Description: "Discord通知付きの停止用URL"
-    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=stop&auth_key=YOUR_KEY"
-  AppCheckURL:
-    Description: "Discord通知付きのIP確認用URL"
-    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check&auth_key=YOUR_KEY"
-
   # -----------------------------------------------------------
   # EventBridge (スケジュール起動・停止)
   # -----------------------------------------------------------
@@ -604,3 +590,17 @@ Outputs:
       FunctionName: !GetAtt OrchestratorLambda.Arn
       Principal: events.amazonaws.com
       SourceArn: !GetAtt StopServerEventRule.Arn
+
+Outputs:
+  PrivateKeySSMPath:
+    Description: "生成された秘密鍵が保存されているSSMパラメータストアのパス"
+    Value: !Sub "/ec2/keypair/${MyKeyPair.KeyPairId}"
+  AppStartURL:
+    Description: "Discord通知付きの起動用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=start&auth_key=YOUR_KEY"
+  AppStopURL:
+    Description: "Discord通知付きの停止用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=stop&auth_key=YOUR_KEY"
+  AppCheckURL:
+    Description: "Discord通知付きのIP確認用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check&auth_key=YOUR_KEY"

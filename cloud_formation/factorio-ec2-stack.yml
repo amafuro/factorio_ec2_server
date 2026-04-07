@@ -218,7 +218,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: DirectEc2ControllerFunctionUrl
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 15
@@ -367,7 +367,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: FactorioOrchestratorFunction
-      Runtime: nodejs20.x
+      Runtime: nodejs24.x
       Handler: index.handler
       Role: !GetAtt OrchestratorLambdaRole.Arn
       Timeout: 120

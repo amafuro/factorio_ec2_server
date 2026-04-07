@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'EC2 Control via Lambda Function URL with Factorio SG, KeyPair, Auto-start script, and RCON Player Check'
+Description: 'Factorio EC2 + Control Lambda (Python) + Orchestrator Lambda (Node.js/Discord)'
 
 Parameters:
   InstanceType:
@@ -25,6 +25,10 @@ Parameters:
     Type: String
     Default: 'factorio-rcon-password'
     Description: SSMパラメータストアに保存したRCON用のパスワード(SecureString推奨)
+  DiscordWebhookUrlParamName:
+    Type: String
+    Default: 'discord-webhook-url'
+    Description: SSMパラメータストアに保存したDiscord Webhook URLの名前（SecureString推奨）
 
 Resources:
   # 1. EC2アクセス用のキーペア
@@ -50,7 +54,6 @@ Resources:
           ToPort: 22
           CidrIp: !Ref SshAllowedCidrParam
           Description: "SSH connection from allowed IP"
-        # RCONポート(27015)はEC2内部（localhost）からのみアクセスするためSGで開ける必要はありません（安全です）
 
   # 3. EC2用のIAMロールとインスタンスプロファイル
   Ec2InstanceRole:
@@ -64,7 +67,6 @@ Resources:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        # SSM Run Commandを受信するために必要なAWS管理ポリシーを追加
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
         - PolicyName: EC2SSMGetParameterPolicy
@@ -101,14 +103,11 @@ Resources:
         Fn::Base64: !Sub
           - |
             #!/bin/bash
-            
-            # SSMからRCONパスワードを取得して隠しファイルに保存
             RCON_PASS=$(aws ssm get-parameter --name "${RconParamName}" --with-decryption --query "Parameter.Value" --output text --region "${AWSRegion}")
             echo "$RCON_PASS" > /home/ec2-user/.rcon_pass
             chmod 600 /home/ec2-user/.rcon_pass
             chown ec2-user:ec2-user /home/ec2-user/.rcon_pass
             
-            # Python製の簡易RCONクライアントスクリプトを作成
             cat << 'EOF_RCON' > /home/ec2-user/rcon.py
             import socket, struct, sys
             def rcon_cmd(host, port, pwd, cmd):
@@ -116,21 +115,16 @@ Resources:
                 s.settimeout(5)
                 try:
                     s.connect((host, port))
-                    # RCON認証パケット
                     s.send(struct.pack('<3i', 10 + len(pwd), 1, 3) + pwd.encode('utf-8') + b'\x00\x00')
                     s.recv(4096)
-                    # コマンド送信パケット
                     s.send(struct.pack('<3i', 10 + len(cmd), 2, 2) + cmd.encode('utf-8') + b'\x00\x00')
-                    # 結果受信
                     resp = s.recv(4096)
-                    if len(resp) >= 12:
-                        return resp[12:-2].decode('utf-8')
+                    if len(resp) >= 12: return resp[12:-2].decode('utf-8')
                     return "No response"
                 except Exception as e:
                     return f"Connection error: {e}"
                 finally:
                     s.close()
-
             if __name__ == '__main__':
                 with open('/home/ec2-user/.rcon_pass', 'r') as f:
                     pwd = f.read().strip()
@@ -139,43 +133,37 @@ Resources:
             chmod +x /home/ec2-user/rcon.py
             chown ec2-user:ec2-user /home/ec2-user/rcon.py
 
-            # Factorio起動用ラッパースクリプトの作成 (RCONオプションを追加)
             cat << 'EOF' > /home/ec2-user/start_factorio.sh
             #!/bin/bash
             SAVE_NAME=$(aws ssm get-parameter --name "${SSMParamName}" --query "Parameter.Value" --output text --region "${AWSRegion}")
             if [ -z "$SAVE_NAME" ]; then SAVE_NAME="default_save"; fi
             RCON_PASS=$(cat /home/ec2-user/.rcon_pass)
-            
             exec /home/ec2-user/factorio/bin/x64/factorio --start-server "$SAVE_NAME" --port 34197 --rcon-port 27015 --rcon-password "$RCON_PASS"
             EOF
             chmod +x /home/ec2-user/start_factorio.sh
             chown ec2-user:ec2-user /home/ec2-user/start_factorio.sh
             
-            # systemdサービス作成と起動
             cat << 'EOF' > /etc/systemd/system/factorio.service
             [Unit]
             Description=Factorio Server
             After=network.target
-
             [Service]
             Type=simple
             User=ec2-user
             WorkingDirectory=/home/ec2-user/factorio/bin/x64
             ExecStart=/home/ec2-user/start_factorio.sh
             Restart=on-failure
-
             [Install]
             WantedBy=multi-user.target
             EOF
             systemctl daemon-reload
             systemctl enable factorio.service
             systemctl start factorio.service
-          # 置換変数
           - SSMParamName: !Ref SaveDataNameParam
             RconParamName: !Ref RconPasswordParamName
             AWSRegion: !Ref AWS::Region
 
-  # 5. Lambda用の権限設定
+  # 5. 直接制御用Lambda(Python)用の権限設定
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -205,7 +193,7 @@ Resources:
                 Action:
                   - ssm:GetParameter
                 Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApiAuthKeyParamName}'
-        - PolicyName: SSMSendCommandPolicy # 追加：LambdaからEC2内でコマンドを実行する権限
+        - PolicyName: SSMSendCommandPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -225,7 +213,7 @@ Resources:
                   - logs:PutLogEvents
                 Resource: 'arn:aws:logs:*:*:*'
 
-  # 6. Lambda関数
+  # 6. 直接制御用Lambda関数
   Ec2ControllerLambda:
     Type: AWS::Lambda::Function
     Properties:
@@ -240,28 +228,18 @@ Resources:
           AUTH_KEY_PARAMETER_NAME: !Ref ApiAuthKeyParamName
       Code:
         ZipFile: |
-          import json
-          import boto3
-          import os
-          import time
-
+          import json, boto3, os, time
           ec2 = boto3.client('ec2')
           ssm = boto3.client('ssm')
           instance_id = os.environ['TARGET_INSTANCE_ID']
           auth_key_param = os.environ['AUTH_KEY_PARAMETER_NAME']
-
           def lambda_handler(event, context):
               try:
                   query_params = event.get('queryStringParameters') or {}
                   provided_key = query_params.get('auth_key')
-          
                   correct_key = ssm.get_parameter(Name=auth_key_param, WithDecryption=True)['Parameter']['Value']
-          
-                  if provided_key != correct_key:
-                      return {'statusCode': 403, 'body': 'Error: Invalid auth_key'}
-
+                  if provided_key != correct_key: return {'statusCode': 403, 'body': 'Error: Invalid auth_key'}
                   action = query_params.get('action')
-          
                   if action == 'start':
                       ec2.start_instances(InstanceIds=[instance_id])
                       result_msg = f"Success: Starting instance {instance_id}"
@@ -282,60 +260,36 @@ Resources:
                       else:
                           result_msg = f"Error: Cannot get IP. Instance is currently [{state}]. Please start the instance first."
                   elif action == 'players':
-                      # サーバーが起動しているか確認
                       response = ec2.describe_instances(InstanceIds=[instance_id])
                       state = response['Reservations'][0]['Instances'][0]['State']['Name']
-                      if state != 'running':
-                          result_msg = f"Error: Instance is [{state}]. Start the server to check players."
-                      else:
-                          # SSM Run Commandを使用してEC2内部のRCONスクリプトを実行
-                          cmd_response = ssm.send_command(
-                              InstanceIds=[instance_id],
-                              DocumentName="AWS-RunShellScript",
-                              Parameters={'commands': ['python3 /home/ec2-user/rcon.py "/players online"']}
-                          )
-                          command_id = cmd_response['Command']['CommandId']
-          
-                          # コマンドの完了を待機 (Lambdaタイムアウトを考慮し最大約8秒)
-                          time.sleep(1.5)
-                          invocation = None
-                          for _ in range(8):
-                              invocation = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
-                              if invocation['Status'] not in ['Pending', 'InProgress']:
-                                  break
-                              time.sleep(1)
-          
-                          result_msg = invocation.get('StandardOutputContent', '').strip()
-                          if not result_msg:
-                              err = invocation.get('StandardErrorContent', '').strip()
-                              result_msg = f"Server is booting or error occurred. Details: {err}" if err else "Failed to fetch player data. Server might still be booting."
-                  else:
-                      return {
-                          'statusCode': 400, 
-                          'body': 'Error: Invalid action. Use ?action=start, stop, status, ip, or players'
-                      }
+                      if state != 'running': return {'statusCode': 200, 'body': f"Error: Instance is [{state}]."}
+                      cmd_response = ssm.send_command(
+                          InstanceIds=[instance_id],
+                          DocumentName="AWS-RunShellScript",
+                          Parameters={'commands': ['python3 /home/ec2-user/rcon.py "/players online"']}
+                      )
+                      command_id = cmd_response['Command']['CommandId']
+                      time.sleep(1.5)
+                      invocation = {}
+                      for _ in range(8):
+                          invocation = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+                          if invocation['Status'] not in ['Pending', 'InProgress']: break
+                          time.sleep(1)
+                      result_msg = invocation.get('StandardOutputContent', '').strip()
+                      if not result_msg: result_msg = "Failed to fetch player data. Server might still be booting."
+                  else: return {'statusCode': 400, 'body': 'Error: Invalid action.'}
+                  return {'statusCode': 200, 'headers': {'Content-Type': 'text/plain; charset=utf-8'}, 'body': result_msg}
+              except Exception as e: return {'statusCode': 500, 'body': f"Error: {str(e)}"}
 
-                  return {
-                      'statusCode': 200,
-                      'headers': {'Content-Type': 'text/plain; charset=utf-8'},
-                      'body': result_msg
-                  }
-              except Exception as e:
-                  return {'statusCode': 500, 'body': f"Error: {str(e)}"}
-
-  # 7. Lambda Function URLの有効化
   LambdaFunctionUrl:
     Type: AWS::Lambda::Url
     Properties:
       AuthType: NONE
       TargetFunctionArn: !GetAtt Ec2ControllerLambda.Arn
       Cors:
-        AllowOrigins:
-          - "*"
-        AllowMethods:
-          - "*"
+        AllowOrigins: ["*"]
+        AllowMethods: ["*"]
 
-  # 8. Function URLへのパブリックアクセス許可
   LambdaUrlPermission:
     Type: AWS::Lambda::Permission
     DependsOn: LambdaFunctionUrl
@@ -345,22 +299,227 @@ Resources:
       Principal: "*"
       FunctionUrlAuthType: NONE
 
+  # -----------------------------------------------------------
+  # Orchestrator
+  # -----------------------------------------------------------
+  OrchestratorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMGetParametersPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApiAuthKeyParamName}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DiscordWebhookUrlParamName}'
+
+  OrchestratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FactorioOrchestratorFunction
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt OrchestratorLambdaRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          BASE_URL: !GetAtt LambdaFunctionUrl.FunctionUrl
+          AUTH_KEY_PARAM: !Ref ApiAuthKeyParamName
+          DISCORD_WEBHOOK_URL_PARAM: !Ref DiscordWebhookUrlParamName
+          PORT: "34197"
+      Code:
+        ZipFile: |
+          const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+          const ssm = new SSMClient();
+
+          const CONFIG = {
+              BASE_URL: process.env.BASE_URL.replace(/\/$/, ''),
+              AUTH_KEY_PARAM: process.env.AUTH_KEY_PARAM,
+              DISCORD_WEBHOOK_URL_PARAM: process.env.DISCORD_WEBHOOK_URL_PARAM,
+              PORT: process.env.PORT
+          };
+
+          let cachedAuthKey = null;
+          let cachedDiscordUrl = null;
+
+          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function initParams() {
+              if (!cachedAuthKey) {
+                  const authCmd = new GetParameterCommand({ Name: CONFIG.AUTH_KEY_PARAM, WithDecryption: true });
+                  cachedAuthKey = (await ssm.send(authCmd)).Parameter.Value;
+              }
+              if (!cachedDiscordUrl) {
+                  try {
+                      const discordCmd = new GetParameterCommand({ Name: CONFIG.DISCORD_WEBHOOK_URL_PARAM, WithDecryption: true });
+                      cachedDiscordUrl = (await ssm.send(discordCmd)).Parameter.Value;
+                  } catch(e) {
+                      console.log("Discord Webhook URL parameter not found or error. Notifications disabled.");
+                      cachedDiscordUrl = 'NONE';
+                  }
+              }
+          }
+
+          async function callLambda_(action) {
+              const url = `${CONFIG.BASE_URL}?action=${action}&auth_key=${cachedAuthKey}`;
+              try {
+                  const res = await fetch(url);
+                  return await res.text();
+              } catch (e) { return `Error: ${e.message}`; }
+          }
+
+          async function notify_(message) {
+              console.log(message);
+              if (!cachedDiscordUrl || cachedDiscordUrl === 'YOUR_DISCORD_WEBHOOK_URL' || cachedDiscordUrl === 'NONE') return;
+              try {
+                  await fetch(cachedDiscordUrl, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ content: message })
+                  });
+              } catch (e) { console.error("Discord通知エラー:", e); }
+          }
+
+          async function startServer() {
+              await notify_("🔄 サーバーのステータスを確認しています...");
+              const status = await callLambda_('status');
+              if (status.includes('Error')) return notify_("❌ エラー: " + status);
+
+              if (status.includes('[running]')) {
+                  await notify_("👉 サーバーは既に [起動中] です。");
+                  const ipRes = await callLambda_('ip');
+                  const ipMatch = ipRes.match(/Public IP:\s*([\d\.]+)/);
+                  if (ipMatch) await notify_(`現在の接続先: \`${ipMatch[1]}:${CONFIG.PORT}\``);
+              } else if (status.includes('[stopped]')) {
+                  await notify_("👉 サーバーは現在 [停止中] です。起動処理を開始します...");
+                  await callLambda_('start');
+                  await notify_("⏳ 起動とIPアドレス割り当てを待機中（最大1分程度）...");
+                  let publicIp = null;
+                  for (let i = 0; i < 6; i++) {
+                      await sleep(10000);
+                      const ipMatch = (await callLambda_('ip')).match(/Public IP:\s*([\d\.]+)/);
+                      if (ipMatch) { publicIp = ipMatch[1]; break; }
+                  }
+                  if (publicIp) await notify_(`🚀 **サーバーが起動しました！**\n接続先: \`${publicIp}:${CONFIG.PORT}\``);
+                  else await notify_("⚠️ 起動に時間がかかっています。少し待ってから check を実行してください。");
+              } else {
+                  await notify_("👉 処理中、または不明なステータスです: " + status);
+              }
+          }
+
+          async function stopServer() {
+              await notify_("🔄 サーバーのステータスを確認しています...");
+              const status = await callLambda_('status');
+              if (status.includes('Error')) return notify_("❌ エラー: " + status);
+
+              if (status.includes('[running]')) {
+                  await notify_("👥 現在のオンラインプレイヤー数を確認しています...");
+                  const players = await callLambda_('players');
+                  if (players.includes('Online players (0)')) {
+                      await notify_("👤 プレイヤー 0人 のため、停止処理を進めます。");
+                  } else if (players.includes('Online players')) {
+                      return notify_(`🎮 現在プレイ中のユーザーがいます。停止をスキップします。\n(${players})`);
+                  } else {
+                      return notify_(`⚠️ プレイヤー人数の取得に失敗しました。安全のためスキップします。\n(${players})`);
+                  }
+                  await notify_("🛑 停止処理を開始します...");
+                  const stopRes = await callLambda_('stop');
+                  if (stopRes.includes('Success')) await notify_("💤 **サーバーの停止処理が正常に完了しました。**");
+                  else await notify_("⚠️ 実行結果: " + stopRes);
+              } else {
+                  await notify_("👉 サーバーは起動中ではないため、停止処理をスキップします。 (" + status + ")");
+              }
+          }
+
+          async function checkServerIP() {
+              await notify_("🔍 パブリックIPを取得しています...");
+              const ipRes = await callLambda_('ip');
+              const ipMatch = ipRes.match(/Public IP:\s*([\d\.]+)/);
+              if (ipMatch) await notify_(`現在の接続先: \`${ipMatch[1]}:${CONFIG.PORT}\``);
+              else await notify_("結果: " + ipRes);
+          }
+
+          exports.handler = async (event) => {
+              try {
+                  await initParams();
+          
+                  let action = '';
+                  let providedKey = '';
+
+                  if (event.queryStringParameters) {
+                      action = event.queryStringParameters.action;
+                      providedKey = event.queryStringParameters.auth_key;
+                  } else if (event.action) {
+                      action = event.action;
+                      providedKey = cachedAuthKey;
+                  }
+
+                  if (providedKey !== cachedAuthKey) {
+                      return { statusCode: 403, body: 'Error: Invalid auth_key' };
+                  }
+
+                  switch (action) {
+                      case 'start':
+                          await startServer();
+                          return { statusCode: 200, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "起動処理完了 (Discordを確認してください)" };
+                      case 'stop':
+                          await stopServer();
+                          return { statusCode: 200, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "停止処理完了 (Discordを確認してください)" };
+                      case 'check':
+                          await checkServerIP();
+                          return { statusCode: 200, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "IP確認完了 (Discordを確認してください)" };
+                      default:
+                          return { statusCode: 400, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "無効なactionです。" };
+                  }
+              } catch (error) {
+                  console.error(error);
+                  return { statusCode: 500, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "Error: " + error.message };
+              }
+          };
+
+  OrchestratorLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt OrchestratorLambda.Arn
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: ["*"]
+
+  OrchestratorLambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: OrchestratorLambdaUrl
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
 Outputs:
   PrivateKeySSMPath:
     Description: "生成された秘密鍵が保存されているSSMパラメータストアのパス"
     Value: !Sub "/ec2/keypair/${MyKeyPair.KeyPairId}"
-  StartURL:
-    Description: "起動用URL"
-    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=start&auth_key=YOUR_KEY"
-  StopURL:
-    Description: "停止用URL"
-    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=stop&auth_key=YOUR_KEY"
-  StatusURL:
-    Description: "状態確認用URL"
-    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=status&auth_key=YOUR_KEY"
-  IpURL:
-    Description: "IPアドレス取得用URL"
-    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=ip&auth_key=YOUR_KEY"
-  PlayersURL: # 追加：人数確認用の出力
-    Description: "オンラインプレイヤー確認用URL"
-    Value: !Sub "${LambdaFunctionUrl.FunctionUrl}?action=players&auth_key=YOUR_KEY"
+
+  # Orchestrator経由でのアクセスURL
+  AppStartURL:
+    Description: "Discord通知付きの起動用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=start&auth_key=YOUR_KEY"
+  AppStopURL:
+    Description: "Discord通知付きの停止用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=stop&auth_key=YOUR_KEY"
+  AppCheckURL:
+    Description: "Discord通知付きのIP確認用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check&auth_key=YOUR_KEY"

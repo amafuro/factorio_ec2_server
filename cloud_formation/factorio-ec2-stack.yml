@@ -278,6 +278,35 @@ Resources:
                       } else {
                           resultMsg = `Error: Cannot get IP. Instance is currently [${state}]. Please start the instance first.`;
                       }
+                  } else if (action === 'save') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const state = response.Reservations[0].Instances[0].State.Name;
+                      if (state !== 'running') {
+                          return { statusCode: 200, body: `Error: Instance is [${state}].` };
+                      }
+          
+                      const cmdResponse = await ssm.send(new SendCommandCommand({
+                          InstanceIds: [instanceId],
+                          DocumentName: "AWS-RunShellScript",
+                          Parameters: { commands: ['python3 /home/ec2-user/rcon.py "/server-save"'] }
+                      }));
+                      const commandId = cmdResponse.Command.CommandId;
+          
+                      await sleep(1500);
+                      let invocation = {};
+                      for (let i = 0; i < 8; i++) {
+                          invocation = await ssm.send(new GetCommandInvocationCommand({
+                              CommandId: commandId,
+                              InstanceId: instanceId
+                          }));
+                          if (!['Pending', 'InProgress'].includes(invocation.Status)) {
+                              break;
+                          }
+                          await sleep(1000);
+                      }
+                      resultMsg = (invocation.StandardOutputContent || '').trim();
+                      if (!resultMsg) resultMsg = "Save command executed.";
+
                   } else if (action === 'players') {
                       const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
                       const state = response.Reservations[0].Instances[0].State.Name;
@@ -476,6 +505,11 @@ Resources:
                   } else {
                       return notify_(`⚠️ プレイヤー人数の取得に失敗しました。安全のためスキップします。\n(${players})`);
                   }
+          
+                  await notify_("💾 サーバーをセーブしています...");
+                  const saveRes = await callLambda_('save');
+                  await notify_(`📝 セーブ結果: ${saveRes}`);
+
                   await notify_("🛑 停止処理を開始します...");
                   const stopRes = await callLambda_('stop');
                   if (stopRes.includes('Success')) await notify_("💤 **サーバーの停止処理が正常に完了しました。**");

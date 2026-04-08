@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Factorio EC2 + Control Lambda (Python) + Orchestrator Lambda (Node.js/Discord)'
+Description: 'Factorio EC2 + Control Lambda (Python) + Orchestrator Lambda (Node.js/Discord) + Discord Slash Command Receiver'
 
 Parameters:
   InstanceType:
@@ -29,6 +29,10 @@ Parameters:
     Type: String
     Default: 'discord-webhook-url'
     Description: SSMパラメータストアに保存したDiscord Webhook URLの名前（SecureString推奨）
+  DiscordPublicKeyParamName:
+    Type: String
+    Default: 'discord-public-key'
+    Description: SSMパラメータストアに保存したDiscord ApplicationのPublic Key
 
 Resources:
   # 1. EC2アクセス用のキーペア
@@ -565,9 +569,6 @@ Resources:
           Id: "TargetOrchestratorLambdaStop"
           Input: '{"action": "stop"}'
 
-  # -----------------------------------------------------------
-  # EventBridgeからOrchestratorLambdaを実行するための権限
-  # -----------------------------------------------------------
   EventBridgeInvokePermissionStart:
     Type: AWS::Lambda::Permission
     Properties:
@@ -584,6 +585,145 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt StopServerEventRule.Arn
 
+  # -----------------------------------------------------------
+  # Discord Slash Command 受付用 Lambda (受付係)
+  # -----------------------------------------------------------
+  DiscordReceiverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DiscordReceiverPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DiscordPublicKeyParamName}'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt OrchestratorLambda.Arn
+
+  DiscordReceiverLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FactorioDiscordReceiverFunction
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt DiscordReceiverRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          PUBLIC_KEY_PARAM: !Ref DiscordPublicKeyParamName
+          WORKER_LAMBDA_NAME: !Ref OrchestratorLambda
+      Code:
+        ZipFile: |
+          const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+          const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
+          const crypto = require("crypto");
+
+          const ssm = new SSMClient();
+          const lambda = new LambdaClient();
+
+          const CONFIG = {
+              PUBLIC_KEY_PARAM: process.env.PUBLIC_KEY_PARAM,
+              WORKER_LAMBDA_NAME: process.env.WORKER_LAMBDA_NAME
+          };
+
+          let cachedPublicKey = null;
+
+          // 外部ライブラリなしでEd25519署名を検証するコード
+          function verifySignature(publicKeyHex, signatureHex, timestamp, body) {
+              try {
+                  const pubKeyBuffer = Buffer.from('302a300506032b6570032100' + publicKeyHex, 'hex');
+                  const publicKey = crypto.createPublicKey({ key: pubKeyBuffer, format: 'der', type: 'spki' });
+                  return crypto.verify(null, Buffer.from(timestamp + body), publicKey, Buffer.from(signatureHex, 'hex'));
+              } catch (e) { return false; }
+          }
+
+          exports.handler = async (event) => {
+              if (event.requestContext?.http?.method !== 'POST') return { statusCode: 405, body: 'Method Not Allowed' };
+
+              const signature = event.headers['x-signature-ed25519'];
+              const timestamp = event.headers['x-signature-timestamp'];
+              const body = event.body;
+
+              if (!signature || !timestamp || !body) return { statusCode: 401, body: 'Missing signature' };
+
+              if (!cachedPublicKey) {
+                  const cmd = new GetParameterCommand({ Name: CONFIG.PUBLIC_KEY_PARAM, WithDecryption: true });
+                  cachedPublicKey = (await ssm.send(cmd)).Parameter.Value;
+              }
+
+              if (!verifySignature(cachedPublicKey, signature, timestamp, body)) {
+                  return { statusCode: 401, body: 'Invalid signature' };
+              }
+
+              const payload = JSON.parse(body);
+
+              // 1. Discordからの接続確認(Ping)対応
+              if (payload.type === 1) {
+                  return { statusCode: 200, body: JSON.stringify({ type: 1 }) };
+              }
+
+              // 2. スラッシュコマンド実行時
+              if (payload.type === 2) {
+                  const commandName = payload.data.name; 
+          
+                  let action = 'check';
+                  // サブコマンドの判定
+                  if (payload.data.options && payload.data.options[0]) {
+                      action = payload.data.options[0].name;
+                  } else if (['start', 'stop', 'check'].includes(commandName)) {
+                      action = commandName;
+                  }
+
+                  // OrchestratorLambdaを非同期(Event)で実行
+                  const invokeCmd = new InvokeCommand({
+                      FunctionName: CONFIG.WORKER_LAMBDA_NAME,
+                      InvocationType: "Event",
+                      Payload: Buffer.from(JSON.stringify({ action: action }))
+                  });
+                  await lambda.send(invokeCmd);
+
+                  return {
+                      statusCode: 200,
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                          type: 4,
+                          data: { content: `🤖 コマンド \`${action}\` を受け付けました。詳細はすぐ下に通知されます！` }
+                      })
+                  };
+              }
+
+              return { statusCode: 400, body: 'Unknown request' };
+          };
+
+  DiscordReceiverLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt DiscordReceiverLambda.Arn
+
+  DiscordReceiverLambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: DiscordReceiverLambdaUrl
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt DiscordReceiverLambda.Arn
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
 Outputs:
   PrivateKeySSMPath:
     Description: "生成された秘密鍵が保存されているSSMパラメータストアのパス"
@@ -597,3 +737,6 @@ Outputs:
   AppCheckURL:
     Description: "Discord通知付きのIP確認用URL"
     Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check"
+  DiscordInteractionsEndpoint:
+    Description: "Discord Application の Interactions Endpoint URL に設定するURL"
+    Value: !GetAtt DiscordReceiverLambdaUrl.FunctionUrl

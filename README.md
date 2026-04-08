@@ -1,14 +1,14 @@
 # 概要
 factorioのサーバーをEC2で建てるためのcloud formationテンプレ。
 
-サーバの起動と停止はLamdaで行い、discordに通知する。
+サーバの起動と停止はLamda経由で行い、discordのスラッシュコマンドで操作する。
 
 EC2を再起動するたびにIPアドレスが変わるため、起動時に接続先をdiscordに通知するようにしている。
 
 # 使い方
-1. サーバースタート用のLamda関数URLを叩く
+1. discord botを招待したチャンネルでスラッシュコマンド`/factorio start`を叩く
 2. discordに通知された接続先を確認して、ゲームに接続する
-3. ゲームを終了したら、サーバーストップ用のLamda関数URLを叩く（まだ接続している人がいたら、エンドポイントを叩いてもサーバーは停止されない）   
+3. ゲームを終了したら、スラッシュコマンド`/factorio stop`を叩く（まだ接続している人がいたら、エンドポイントを叩いてもサーバーは停止されない）   
 
 また、EventBrigeによって、23時に自動でサーバーが開始し、翌日1時に自動でサーバーが停止するようにしている。
 
@@ -17,13 +17,15 @@ EC2を再起動するたびにIPアドレスが変わるため、起動時に接
 ## parameter storeにパラメータを登録する
 
 以下のパラメータについて、任意の値をparameter storeに登録する。
-DISCORD_WEBHOOK_URLは、discordのチャンネル設定から発行しておく。
+discord-webhook-urlは、discordのチャンネル設定から発行しておく。
+またdiscord-public-keyは、[Discord Developer Portal](https://discord.com/developers/applications) でbotを作成し、設定画面（General Information）にある PUBLIC KEY をコピーしておく。
 
 * ec2-api-auth-key
 * ec2-ssh-allowed-cidr
 * factorio-save-data-name（後でアップするセーブデータと同じ名前を登録しておく）
 * factorio-rcon-password
 * discord-webhook-url
+* discord-public-key
 
 ## cloud formationでスタックを作成する
 
@@ -45,7 +47,16 @@ rm factorio_headless_x64_2.0.76.tar.gz
 
 最後にローカルのセーブデータを`/factorio/bin/x64/`へscpコマンドなどで配置する。
 
-配置後、CloudFormationのoutputに出力されたAppStartURLとAppStopURLを叩くとサーバーを起動・停止でき、discordに接続先が通知される。
+## discord botの設定
+
+[Discord Developer Portal](https://discord.com/developers/applications)を開き、General Information を選択する。
+
+Interactions Endpoint URL の欄に、cloud formationのoutputにある、DiscordInteractionsEndpointのURLを貼り付けて「Save Changes」をクリックする。
+
+`bash/add_discord_slash_command.sh`のYOUR_APP_ID（Application ID）と YOUR_BOT_TOKEN（BotタブにあるToken）を置き換えて実行する。
+
+
+botをdiscordのチャンネルにインストールし、スラッシュコマンド`/factorio start`・`/factorio stop`を叩くとサーバーを起動・停止でき、discordに接続先が通知される。
 
 # その他
 セーブデータの持ち主がspase_ageのDLCを買っていてて、他の参加者が買っていない場合、サーバーログイン時に「modが違うので、同期しますか」が何度もでてログイン出来ないことがあった（DLCを買っているだけで、他はバニラ）。

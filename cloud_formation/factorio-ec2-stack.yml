@@ -579,24 +579,24 @@ Resources:
   # -----------------------------------------------------------
   # EventBridge (スケジュール起動・停止)
   # -----------------------------------------------------------
-  # 日本時間23:00 (UTC 14:00) に起動
+  # 日本時間22:00 (UTC 13:00) に起動
   StartServerEventRule:
     Type: AWS::Events::Rule
     Properties:
       Description: "Start Factorio server daily at 23:00 JST"
-      ScheduleExpression: "cron(0 14 * * ? *)"
+      ScheduleExpression: "cron(0 13 * * ? *)"
       State: ENABLED
       Targets:
         - Arn: !GetAtt OrchestratorLambda.Arn
           Id: "TargetOrchestratorLambdaStart"
           Input: '{"action": "start"}'
 
-  # 日本時間01:00 (UTC 16:00) に停止
+  # 日本時間00:00 (UTC 15:00) に停止
   StopServerEventRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: "Stop Factorio server daily at 01:00 JST"
-      ScheduleExpression: "cron(0 16 * * ? *)"
+      Description: "Stop Factorio server daily at 00:00 JST"
+      ScheduleExpression: "cron(0 15 * * ? *)"
       State: ENABLED
       Targets:
         - Arn: !GetAtt OrchestratorLambda.Arn

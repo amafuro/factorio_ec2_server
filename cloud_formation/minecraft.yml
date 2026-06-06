@@ -1,0 +1,820 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Minecraft EC2 + Control Lambda (Python) + Orchestrator Lambda (Node.js/Discord) + Discord Slash Command Receiver'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.small
+    Description: 作成するEC2インスタンスのタイプ（Minecraft用のためメモリ2GB以上の t3.small 以上を推奨）
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
+  MinecraftVersion:
+    Type: String
+    Default: '26.1.2'
+    Description: インストールするMinecraftのバージョン
+  ApiAuthKeyParamName:
+    Type: String
+    Default: 'ec2-api-auth-key'
+    Description: SSMパラメータストアに保存したLambda用の認証キーの名前
+  SshAllowedCidrParam:
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: 'ec2-ssh-allowed-cidr'
+    Description: SSHアクセスを許可するIPアドレスが保存されたSSMパラメータの名前
+  WorldNameParam:
+    Type: String
+    Default: 'minecraft-world-name'
+    Description: SSMパラメータストアに保存したワールド名(level-name)
+  RconPasswordParamName:
+    Type: String
+    Default: 'minecraft-rcon-password'
+    Description: SSMパラメータストアに保存したRCON用のパスワード(SecureString推奨)
+  DiscordWebhookUrlParamName:
+    Type: String
+    Default: 'discord-webhook-url'
+    Description: SSMパラメータストアに保存したDiscord Webhook URLの名前（SecureString推奨）
+  DiscordPublicKeyParamName:
+    Type: String
+    Default: 'discord-public-key'
+    Description: SSMパラメータストアに保存したDiscord ApplicationのPublic Key
+
+Resources:
+  # 1. EC2アクセス用のキーペア
+  MyKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: minecraft-ec2-key
+      KeyType: rsa
+
+  # 2. Minecraft用およびSSH用セキュリティグループ
+  MinecraftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow Minecraft custom TCP port and SSH"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+          CidrIp: 0.0.0.0/0
+          Description: "Minecraft multiplayer port"
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshAllowedCidrParam
+          Description: "SSH connection from allowed IP"
+
+  # 3. EC2用のIAMロールとインスタンスプロファイル
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EC2SSMGetParameterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${WorldNameParam}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${RconPasswordParamName}'
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  # 4. EC2インスタンス
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref MyKeyPair
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SecurityGroupIds:
+        - !GetAtt MinecraftSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: ManagedMinecraftControlInstance
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            # Javaとjq(JSONパーサー)のインストール
+            dnf update -y
+            dnf install -y java-21-amazon-corretto-headless jq
+
+            RCON_PASS=$(aws ssm get-parameter --name "${RconParamName}" --with-decryption --query "Parameter.Value" --output text --region "${AWSRegion}")
+            echo "$RCON_PASS" > /home/ec2-user/.rcon_pass
+            chmod 600 /home/ec2-user/.rcon_pass
+            chown ec2-user:ec2-user /home/ec2-user/.rcon_pass
+            
+            mkdir -p /home/ec2-user/minecraft
+            chown ec2-user:ec2-user /home/ec2-user/minecraft
+
+            # Minecraft向けのRCONクライアント (Source RCONプロトコル)
+            cat << 'EOF_RCON' > /home/ec2-user/rcon.py
+            import socket, struct, sys
+            def rcon_cmd(host, port, pwd, cmd):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5)
+                try:
+                    s.connect((host, port))
+                    s.send(struct.pack('<3i', 10 + len(pwd), 1, 3) + pwd.encode('utf-8') + b'\x00\x00')
+                    s.recv(4096)
+                    s.send(struct.pack('<3i', 10 + len(cmd), 2, 2) + cmd.encode('utf-8') + b'\x00\x00')
+                    resp = s.recv(4096)
+                    if len(resp) >= 12: return resp[12:-2].decode('utf-8')
+                    return "No response"
+                except Exception as e:
+                    return f"Connection error: {e}"
+                finally:
+                    s.close()
+            if __name__ == '__main__':
+                with open('/home/ec2-user/.rcon_pass', 'r') as f:
+                    pwd = f.read().strip()
+                print(rcon_cmd('127.0.0.1', 25575, pwd, sys.argv[1]))
+            EOF_RCON
+            chmod +x /home/ec2-user/rcon.py
+            chown ec2-user:ec2-user /home/ec2-user/rcon.py
+
+            # 起動スクリプトの作成
+            cat << 'EOF' > /home/ec2-user/start_minecraft.sh
+            #!/bin/bash
+            cd /home/ec2-user/minecraft
+
+            MC_VERSION="${MinecraftVersionParam}"
+
+            # サーバーjarが存在しない場合はMojang公式APIからURLを取得して自動ダウンロード
+            if [ ! -f server.jar ]; then
+                echo "Fetching download URL for Minecraft $MC_VERSION..."
+                MANIFEST_URL="https://launchermeta.mojang.com/mc/game/version_manifest.json"
+                VERSION_URL=$(curl -s $MANIFEST_URL | jq -r ".versions[] | select(.id == \"$MC_VERSION\") | .url")
+            
+                if [ -n "$VERSION_URL" ] && [ "$VERSION_URL" != "null" ]; then
+                    SERVER_URL=$(curl -s $VERSION_URL | jq -r ".downloads.server.url")
+                    wget -O server.jar $SERVER_URL
+                    echo "eula=true" > eula.txt
+                else
+                    echo "Error: Version $MC_VERSION not found in Mojang manifest. Please check the version string."
+                    exit 1
+                fi
+            fi
+
+            WORLD_NAME=$(aws ssm get-parameter --name "${SSMParamName}" --query "Parameter.Value" --output text --region "${AWSRegion}")
+            if [ -z "$WORLD_NAME" ]; then WORLD_NAME="world"; fi
+            RCON_PASS=$(cat /home/ec2-user/.rcon_pass)
+
+            # server.properties の作成/更新
+            if [ ! -f server.properties ]; then touch server.properties; fi
+            grep -q "^level-name=" server.properties || echo "level-name=$WORLD_NAME" >> server.properties
+            sed -i "s/^level-name=.*/level-name=$WORLD_NAME/" server.properties
+            
+            grep -q "^enable-rcon=" server.properties || echo "enable-rcon=true" >> server.properties
+            sed -i 's/^enable-rcon=.*/enable-rcon=true/' server.properties
+            
+            grep -q "^rcon\.port=" server.properties || echo "rcon.port=25575" >> server.properties
+            sed -i 's/^rcon\.port=.*/rcon.port=25575/' server.properties
+            
+            grep -q "^rcon\.password=" server.properties || echo "rcon.password=$RCON_PASS" >> server.properties
+            sed -i "s/^rcon\.password=.*/rcon.password=$RCON_PASS/" server.properties
+
+            # メモリ割り当ては1GBを設定 (t3.small用)
+            exec java -Xmx1024M -Xms1024M -jar server.jar nogui
+            EOF
+            chmod +x /home/ec2-user/start_minecraft.sh
+            chown ec2-user:ec2-user /home/ec2-user/start_minecraft.sh
+            
+            cat << 'EOF' > /etc/systemd/system/minecraft.service
+            [Unit]
+            Description=Minecraft Server
+            After=network.target
+            [Service]
+            Type=simple
+            User=ec2-user
+            WorkingDirectory=/home/ec2-user/minecraft
+            ExecStart=/home/ec2-user/start_minecraft.sh
+            Restart=on-failure
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable minecraft.service
+            systemctl start minecraft.service
+          - SSMParamName: !Ref WorldNameParam
+            RconParamName: !Ref RconPasswordParamName
+            MinecraftVersionParam: !Ref MinecraftVersion
+            AWSRegion: !Ref AWS::Region
+
+  # 5. 直接制御用Lambda(Python)用の権限設定
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2ControlPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                Resource: "*"
+        - PolicyName: SSMGetParameterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApiAuthKeyParamName}'
+        - PolicyName: SSMSendCommandPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource: "*"
+        - PolicyName: LambdaLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  # 6. 直接制御用Lambda関数
+  Ec2ControllerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DirectMinecraftControllerFunctionUrl
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          TARGET_INSTANCE_ID: !Ref MyEC2Instance
+          AUTH_KEY_PARAMETER_NAME: !Ref ApiAuthKeyParamName
+      Code:
+        ZipFile: |
+          const { EC2Client, StartInstancesCommand, StopInstancesCommand, DescribeInstancesCommand } = require("@aws-sdk/client-ec2");
+          const { SSMClient, GetParameterCommand, SendCommandCommand, GetCommandInvocationCommand } = require("@aws-sdk/client-ssm");
+
+          const ec2 = new EC2Client();
+          const ssm = new SSMClient();
+
+          const instanceId = process.env.TARGET_INSTANCE_ID;
+          const authKeyParam = process.env.AUTH_KEY_PARAMETER_NAME;
+
+          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+          exports.handler = async (event) => {
+              try {
+                  const queryParams = event.queryStringParameters || {};
+                  const providedKey = queryParams.auth_key;
+          
+                  const authCmd = new GetParameterCommand({ Name: authKeyParam, WithDecryption: true });
+                  const correctKey = (await ssm.send(authCmd)).Parameter.Value;
+          
+                  if (providedKey !== correctKey) {
+                      return { statusCode: 403, body: 'Error: Invalid auth_key' };
+                  }
+          
+                  const action = queryParams.action;
+                  let resultMsg = "";
+          
+                  if (action === 'start') {
+                      await ec2.send(new StartInstancesCommand({ InstanceIds: [instanceId] }));
+                      resultMsg = `Success: Starting instance ${instanceId}`;
+                  } else if (action === 'stop') {
+                      await ec2.send(new StopInstancesCommand({ InstanceIds: [instanceId] }));
+                      resultMsg = `Success: Stopping instance ${instanceId}`;
+                  } else if (action === 'status') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const state = response.Reservations[0].Instances[0].State.Name;
+                      resultMsg = `Status: Instance ${instanceId} is currently [${state}]`;
+                  } else if (action === 'ip') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const instance = response.Reservations[0].Instances[0];
+                      const state = instance.State.Name;
+                      if (state === 'running') {
+                          const publicIp = instance.PublicIpAddress || 'No Public IP assigned yet';
+                          resultMsg = `Public IP: ${publicIp}`;
+                      } else {
+                          resultMsg = `Error: Cannot get IP. Instance is currently [${state}]. Please start the instance first.`;
+                      }
+                  } else if (action === 'save') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const state = response.Reservations[0].Instances[0].State.Name;
+                      if (state !== 'running') {
+                          return { statusCode: 200, body: `Error: Instance is [${state}].` };
+                      }
+          
+                      const cmdResponse = await ssm.send(new SendCommandCommand({
+                          InstanceIds: [instanceId],
+                          DocumentName: "AWS-RunShellScript",
+                          Parameters: { commands: ['python3 /home/ec2-user/rcon.py "save-all"'] }
+                      }));
+                      const commandId = cmdResponse.Command.CommandId;
+          
+                      await sleep(1500);
+                      let invocation = {};
+                      for (let i = 0; i < 8; i++) {
+                          invocation = await ssm.send(new GetCommandInvocationCommand({
+                              CommandId: commandId,
+                              InstanceId: instanceId
+                          }));
+                          if (!['Pending', 'InProgress'].includes(invocation.Status)) {
+                              break;
+                          }
+                          await sleep(1000);
+                      }
+                      resultMsg = (invocation.StandardOutputContent || '').trim();
+                      if (!resultMsg) resultMsg = "Save command executed.";
+
+                  } else if (action === 'players') {
+                      const response = await ec2.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }));
+                      const state = response.Reservations[0].Instances[0].State.Name;
+                      if (state !== 'running') {
+                          return { statusCode: 200, body: `Error: Instance is [${state}].` };
+                      }
+          
+                      const cmdResponse = await ssm.send(new SendCommandCommand({
+                          InstanceIds: [instanceId],
+                          DocumentName: "AWS-RunShellScript",
+                          Parameters: { commands: ['python3 /home/ec2-user/rcon.py "list"'] }
+                      }));
+                      const commandId = cmdResponse.Command.CommandId;
+          
+                      await sleep(1500);
+                      let invocation = {};
+                      for (let i = 0; i < 8; i++) {
+                          invocation = await ssm.send(new GetCommandInvocationCommand({
+                              CommandId: commandId,
+                              InstanceId: instanceId
+                          }));
+                          if (!['Pending', 'InProgress'].includes(invocation.Status)) {
+                              break;
+                          }
+                          await sleep(1000);
+                      }
+                      resultMsg = (invocation.StandardOutputContent || '').trim();
+                      if (!resultMsg) {
+                          resultMsg = "Failed to fetch player data. Server might still be booting.";
+                      }
+                  } else {
+                      return { statusCode: 400, body: 'Error: Invalid action.' };
+                  }
+          
+                  return { 
+                      statusCode: 200, 
+                      headers: { 'Content-Type': 'text/plain; charset=utf-8' }, 
+                      body: resultMsg 
+                  };
+              } catch (e) {
+                  return { statusCode: 500, body: `Error: ${e.message}` };
+              }
+          };
+
+  LambdaFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt Ec2ControllerLambda.Arn
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: ["*"]
+
+  LambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: LambdaFunctionUrl
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt Ec2ControllerLambda.Arn
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # -----------------------------------------------------------
+  # Orchestrator
+  # -----------------------------------------------------------
+  OrchestratorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMGetParametersPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ApiAuthKeyParamName}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DiscordWebhookUrlParamName}'
+
+  OrchestratorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MinecraftOrchestratorFunction
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt OrchestratorLambdaRole.Arn
+      Timeout: 120
+      Environment:
+        Variables:
+          BASE_URL: !GetAtt LambdaFunctionUrl.FunctionUrl
+          AUTH_KEY_PARAM: !Ref ApiAuthKeyParamName
+          DISCORD_WEBHOOK_URL_PARAM: !Ref DiscordWebhookUrlParamName
+          PORT: "25565"
+      Code:
+        ZipFile: |
+          const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+          const ssm = new SSMClient();
+
+          const CONFIG = {
+              BASE_URL: process.env.BASE_URL.replace(/\/$/, ''),
+              AUTH_KEY_PARAM: process.env.AUTH_KEY_PARAM,
+              DISCORD_WEBHOOK_URL_PARAM: process.env.DISCORD_WEBHOOK_URL_PARAM,
+              PORT: process.env.PORT
+          };
+
+          let cachedAuthKey = null;
+          let cachedDiscordUrl = null;
+
+          const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+          async function initParams() {
+              if (!cachedAuthKey) {
+                  const authCmd = new GetParameterCommand({ Name: CONFIG.AUTH_KEY_PARAM, WithDecryption: true });
+                  cachedAuthKey = (await ssm.send(authCmd)).Parameter.Value;
+              }
+              if (!cachedDiscordUrl) {
+                  try {
+                      const discordCmd = new GetParameterCommand({ Name: CONFIG.DISCORD_WEBHOOK_URL_PARAM, WithDecryption: true });
+                      cachedDiscordUrl = (await ssm.send(discordCmd)).Parameter.Value;
+                  } catch(e) {
+                      console.log("Discord Webhook URL parameter not found or error. Notifications disabled.");
+                      cachedDiscordUrl = 'NONE';
+                  }
+              }
+          }
+
+          async function callLambda_(action) {
+              const url = `${CONFIG.BASE_URL}?action=${action}&auth_key=${cachedAuthKey}`;
+              try {
+                  const res = await fetch(url);
+                  return await res.text();
+              } catch (e) { return `Error: ${e.message}`; }
+          }
+
+          async function notify_(message) {
+              console.log(message);
+              if (!cachedDiscordUrl || cachedDiscordUrl === 'YOUR_DISCORD_WEBHOOK_URL' || cachedDiscordUrl === 'NONE') return;
+              try {
+                  await fetch(cachedDiscordUrl, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ content: message })
+                  });
+              } catch (e) { console.error("Discord通知エラー:", e); }
+          }
+
+          async function startServer() {
+              await notify_("🔄 サーバーのステータスを確認しています...");
+              const status = await callLambda_('status');
+              if (status.includes('Error')) return notify_("❌ エラー: " + status);
+
+              if (status.includes('[running]')) {
+                  await notify_("👉 サーバーは既に [起動中] です。");
+                  const ipRes = await callLambda_('ip');
+                  const ipMatch = ipRes.match(/Public IP:\s*([\d\.]+)/);
+                  if (ipMatch) await notify_(`現在の接続先: \`${ipMatch[1]}:${CONFIG.PORT}\``);
+              } else if (status.includes('[stopped]')) {
+                  await notify_("👉 サーバーは現在 [停止中] です。起動処理を開始します...");
+                  await callLambda_('start');
+                  await notify_("⏳ 起動とIPアドレス割り当てを待機中（最大1分程度）...");
+                  let publicIp = null;
+                  for (let i = 0; i < 6; i++) {
+                      await sleep(10000);
+                      const ipMatch = (await callLambda_('ip')).match(/Public IP:\s*([\d\.]+)/);
+                      if (ipMatch) { publicIp = ipMatch[1]; break; }
+                  }
+                  if (publicIp) await notify_(`🚀 **サーバーが起動しました！**\n接続先: \`${publicIp}:${CONFIG.PORT}\``);
+                  else await notify_("⚠️ 起動に時間がかかっています。少し待ってから check を実行してください。");
+              } else {
+                  await notify_("👉 処理中、または不明なステータスです: " + status);
+              }
+          }
+
+          async function stopServer() {
+              await notify_("🔄 サーバーのステータスを確認しています...");
+              const status = await callLambda_('status');
+              if (status.includes('Error')) return notify_("❌ エラー: " + status);
+
+              if (status.includes('[running]')) {
+                  await notify_("👥 現在のオンラインプレイヤー数を確認しています...");
+                  const players = await callLambda_('players');
+                  // Minecraftの '/list' の出力「There are 0 of a max of ...」で判定
+                  if (players.match(/There are 0 of a max/)) {
+                      await notify_("👤 プレイヤー 0人 のため、停止処理を進めます。");
+                  } else if (players.includes('players online')) {
+                      return notify_(`🎮 現在プレイ中のユーザーがいます。停止をスキップします。\n(${players})`);
+                  } else {
+                      return notify_(`⚠️ プレイヤー人数の取得に失敗しました。安全のためスキップします。\n(${players})`);
+                  }
+          
+                  await notify_("💾 サーバーをセーブしています...");
+                  const saveRes = await callLambda_('save');
+                  await notify_(`📝 セーブ結果: ${saveRes}`);
+
+                  await notify_("🛑 停止処理を開始します...");
+                  const stopRes = await callLambda_('stop');
+                  if (stopRes.includes('Success')) await notify_("💤 **サーバーの停止処理が正常に完了しました。**");
+                  else await notify_("⚠️ 実行結果: " + stopRes);
+              } else {
+                  await notify_("👉 サーバーは起動中ではないため、停止処理をスキップします。 (" + status + ")");
+              }
+          }
+
+          async function checkServerIP() {
+              await notify_("🔍 パブリックIPを取得しています...");
+              const ipRes = await callLambda_('ip');
+              const ipMatch = ipRes.match(/Public IP:\s*([\d\.]+)/);
+              if (ipMatch) await notify_(`現在の接続先: \`${ipMatch[1]}:${CONFIG.PORT}\``);
+              else await notify_("結果: " + ipRes);
+          }
+
+          exports.handler = async (event) => {
+              try {
+                  await initParams();
+          
+                  let action = '';
+
+                  if (event.queryStringParameters) {
+                      action = event.queryStringParameters.action;
+                  } else if (event.action) {
+                      action = event.action;
+                  }
+
+                  switch (action) {
+                      case 'start':
+                          await startServer();
+                          return { statusCode: 200, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "起動処理完了 (Discordを確認してください)" };
+                      case 'stop':
+                          await stopServer();
+                          return { statusCode: 200, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "停止処理完了 (Discordを確認してください)" };
+                      case 'check':
+                          await checkServerIP();
+                          return { statusCode: 200, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "IP確認完了 (Discordを確認してください)" };
+                      default:
+                          return { statusCode: 400, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "無効なactionです。" };
+                  }
+              } catch (error) {
+                  console.error(error);
+                  return { statusCode: 500, headers: {'Content-Type': 'text/plain; charset=utf-8'}, body: "Error: " + error.message };
+              }
+          };
+
+  OrchestratorLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt OrchestratorLambda.Arn
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: ["*"]
+
+  OrchestratorLambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: OrchestratorLambdaUrl
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # -----------------------------------------------------------
+  # EventBridge (スケジュール起動・停止)
+  # -----------------------------------------------------------
+  StartServerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Start Minecraft server daily at 23:00 JST"
+      ScheduleExpression: "cron(0 13 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrchestratorLambda.Arn
+          Id: "TargetOrchestratorLambdaStart"
+          Input: '{"action": "start"}'
+
+  StopServerEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Stop Minecraft server daily at 00:00 JST"
+      ScheduleExpression: "cron(0 15 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrchestratorLambda.Arn
+          Id: "TargetOrchestratorLambdaStop"
+          Input: '{"action": "stop"}'
+
+  EventBridgeInvokePermissionStart:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartServerEventRule.Arn
+
+  EventBridgeInvokePermissionStop:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt OrchestratorLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopServerEventRule.Arn
+
+  # -----------------------------------------------------------
+  # Discord Slash Command 受付用 Lambda (受付係)
+  # -----------------------------------------------------------
+  DiscordReceiverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DiscordReceiverPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DiscordPublicKeyParamName}'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt OrchestratorLambda.Arn
+
+  DiscordReceiverLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MinecraftDiscordReceiverFunction
+      Runtime: nodejs24.x
+      Handler: index.handler
+      Role: !GetAtt DiscordReceiverRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          PUBLIC_KEY_PARAM: !Ref DiscordPublicKeyParamName
+          WORKER_LAMBDA_NAME: !Ref OrchestratorLambda
+      Code:
+        ZipFile: |
+          const { SSMClient, GetParameterCommand } = require("@aws-sdk/client-ssm");
+          const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
+          const crypto = require("crypto");
+
+          const ssm = new SSMClient();
+          const lambda = new LambdaClient();
+
+          const CONFIG = {
+              PUBLIC_KEY_PARAM: process.env.PUBLIC_KEY_PARAM,
+              WORKER_LAMBDA_NAME: process.env.WORKER_LAMBDA_NAME
+          };
+
+          let cachedPublicKey = null;
+
+          function verifySignature(publicKeyHex, signatureHex, timestamp, body) {
+              try {
+                  const pubKeyBuffer = Buffer.from('302a300506032b6570032100' + publicKeyHex, 'hex');
+                  const publicKey = crypto.createPublicKey({ key: pubKeyBuffer, format: 'der', type: 'spki' });
+                  return crypto.verify(null, Buffer.from(timestamp + body), publicKey, Buffer.from(signatureHex, 'hex'));
+              } catch (e) { return false; }
+          }
+
+          exports.handler = async (event) => {
+              if (event.requestContext?.http?.method !== 'POST') return { statusCode: 405, body: 'Method Not Allowed' };
+
+              const signature = event.headers['x-signature-ed25519'];
+              const timestamp = event.headers['x-signature-timestamp'];
+              const body = event.body;
+
+              if (!signature || !timestamp || !body) return { statusCode: 401, body: 'Missing signature' };
+
+              if (!cachedPublicKey) {
+                  const cmd = new GetParameterCommand({ Name: CONFIG.PUBLIC_KEY_PARAM, WithDecryption: true });
+                  cachedPublicKey = (await ssm.send(cmd)).Parameter.Value;
+              }
+
+              if (!verifySignature(cachedPublicKey, signature, timestamp, body)) {
+                  return { statusCode: 401, body: 'Invalid signature' };
+              }
+
+              const payload = JSON.parse(body);
+
+              if (payload.type === 1) {
+                  return { statusCode: 200, body: JSON.stringify({ type: 1 }) };
+              }
+
+              if (payload.type === 2) {
+                  const commandName = payload.data.name; 
+          
+                  let action = 'check';
+                  if (payload.data.options && payload.data.options[0]) {
+                      action = payload.data.options[0].name;
+                  } else if (['start', 'stop', 'check'].includes(commandName)) {
+                      action = commandName;
+                  }
+
+                  const invokeCmd = new InvokeCommand({
+                      FunctionName: CONFIG.WORKER_LAMBDA_NAME,
+                      InvocationType: "Event",
+                      Payload: Buffer.from(JSON.stringify({ action: action }))
+                  });
+                  await lambda.send(invokeCmd);
+
+                  return {
+                      statusCode: 200,
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                          type: 4,
+                          data: { content: `🤖 コマンド \`${action}\` を受け付けました。詳細はすぐ下に通知されます！` }
+                      })
+                  };
+              }
+
+              return { statusCode: 400, body: 'Unknown request' };
+          };
+
+  DiscordReceiverLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt DiscordReceiverLambda.Arn
+
+  DiscordReceiverLambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: DiscordReceiverLambdaUrl
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !GetAtt DiscordReceiverLambda.Arn
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+Outputs:
+  PrivateKeySSMPath:
+    Description: "生成された秘密鍵が保存されているSSMパラメータストアのパス"
+    Value: !Sub "/ec2/keypair/${MyKeyPair.KeyPairId}"
+  AppStartURL:
+    Description: "Discord通知付きの起動用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=start"
+  AppStopURL:
+    Description: "Discord通知付きの停止用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=stop"
+  AppCheckURL:
+    Description: "Discord通知付きのIP確認用URL"
+    Value: !Sub "${OrchestratorLambdaUrl.FunctionUrl}?action=check"
+  DiscordInteractionsEndpoint:
+    Description: "Discord Application の Interactions Endpoint URL に設定するURL"
+    Value: !GetAtt DiscordReceiverLambdaUrl.FunctionUrl
